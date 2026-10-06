@@ -1,0 +1,337 @@
+
+import argparse
+import base64
+import io
+import json
+import math
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+import mujoco
+import mujoco.viewer
+
+from config import QWEN_CONFIG
+
+SCENE_XML = "src/robot_scene.xml"
+FRAME_SAVE_DIR = "tmp/camera_frames"
+CAMERA_RES = (240, 320)
+
+JOINT_LIMITS = [
+    (-math.pi, math.pi),
+    (-math.pi / 2, math.pi / 2),
+    (-2.0, 2.0),
+    (-math.pi, math.pi),
+    (-math.pi / 2, math.pi / 2),
+    (-math.pi, math.pi),
+]
+
+
+def lerp(a, b, t):
+    return a + t * (b - a)
+
+
+# ============================================================================
+# Camera System
+# ============================================================================
+class CameraSystem:
+    def __init__(self, model, data):
+        self.model = model
+        self.data = data
+        self.renderer = mujoco.Renderer(model, *CAMERA_RES)
+        os.makedirs(FRAME_SAVE_DIR, exist_ok=True)
+        self.frame_count = 0
+
+    def capture(self, camera_name, save=False):
+        self.renderer.update_scene(self.data, camera=camera_name)
+        rgb = self.renderer.render()
+        if save:
+            path = Path(FRAME_SAVE_DIR) / f"{camera_name}_{self.frame_count:04d}.png"
+            Image.fromarray(rgb).save(path)
+            self.frame_count += 1
+        return rgb
+
+    def capture_both(self, save=False):
+        eye = self.capture("eye_in_hand", save=save)
+        env = self.capture("env_camera", save=save)
+        return {"eye_in_hand": eye, "env_camera": env}
+
+    def close(self):
+        self.renderer.close()
+
+
+# ============================================================================
+# Vision Processor (Local Stereo Perception)
+# ============================================================================
+class VisionProcessor:
+    """Detect red apple in camera images and estimate its 3D position.
+    Uses pixel-to-ray projection + plane intersection for depth estimation.
+    """
+
+    def __init__(self, model, data):
+        self.model = model
+        self.data = data
+        self.res_h, self.res_w = CAMERA_RES
+
+    def detect_red_object(self, rgb, score_thresh=80, grow_ratio=0.7, min_pixels=10, max_pixels=5000):
+        """Detect red apple using score-based flood fill."""
+        r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+        red_score = r.astype(float) - 0.5 * g.astype(float) - 0.5 * b.astype(float)
+        max_idx = np.unravel_index(np.argmax(red_score), red_score.shape)
+        cy, cx = max_idx
+        max_score = red_score[cy, cx]
+        if max_score < score_thresh:
+            return None
+
+        for ratio in [grow_ratio, grow_ratio + 0.1, grow_ratio + 0.2, grow_ratio + 0.3]:
+            threshold = max(max_score * ratio, score_thresh * 0.8)
+            mask = red_score > threshold
+            h, w = mask.shape
+            visited = np.zeros_like(mask, dtype=bool)
+            queue = [(cx, cy)]
+            visited[cy, cx] = True
+            component = [(cx, cy)]
+            while queue:
+                x, y = queue.pop(0)
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < w and 0 <= ny < h and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        component.append((nx, ny))
+                        queue.append((nx, ny))
+            if min_pixels <= len(component) <= max_pixels:
+                cx_m = int(np.mean([p[0] for p in component]))
+                cy_m = int(np.mean([p[1] for p in component]))
+                return {"center": (cx_m, cy_m), "pixels": len(component), "max_score": max_score}
+        return None
+
+    def pixel_to_world_ray(self, camera_name, cx, cy):
+        """Convert pixel coordinate to world-space ray."""
+        cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+        fovy = self.model.cam_fovy[cam_id] * np.pi / 180
+        x_ndc = (cx - self.res_w / 2) / (self.res_w / 2)
+        y_ndc = -(cy - self.res_h / 2) / (self.res_h / 2)
+        tan_fovy2 = np.tan(fovy / 2)
+        aspect = self.res_w / self.res_h
+        dx = x_ndc * tan_fovy2 * aspect
+        dy = y_ndc * tan_fovy2
+        dz = -1.0
+        ray_cam = np.array([dx, dy, dz])
+        ray_cam = ray_cam / np.linalg.norm(ray_cam)
+        R = self.data.cam_xmat[cam_id].reshape(3, 3)
+        ray_world = R @ ray_cam
+        cam_pos = self.data.cam_xpos[cam_id].copy()
+        return cam_pos, ray_world
+
+    def estimate_apple_position(self, rgb_dict):
+        """Estimate apple 3D position from both cameras."""
+        estimates = []
+        weights = []
+        env_det = None
+        eye_det = None
+
+        # Primary: env_camera (always sees the apple reliably)
+        env_rgb = rgb_dict.get("env_camera")
+        if env_rgb is not None:
+            env_det = self.detect_red_object(env_rgb, score_thresh=80)
+            if env_det and env_det["max_score"] > 100:
+                origin, direction = self.pixel_to_world_ray("env_camera", *env_det["center"])
+                if abs(direction[2]) > 1e-6:
+                    t = (0.0775 - origin[2]) / direction[2]
+                    if t > 0:
+                        est = origin + t * direction
+                        estimates.append(est)
+                        weights.append(2.0)
+
+        # Secondary: eye_in_hand (use only when confident)
+        eye_rgb = rgb_dict.get("eye_in_hand")
+        if eye_rgb is not None:
+            eye_det = self.detect_red_object(eye_rgb, score_thresh=100)
+            if eye_det and eye_det["max_score"] > 120:
+                origin, direction = self.pixel_to_world_ray("eye_in_hand", *eye_det["center"])
+                if abs(direction[2]) > 1e-6:
+                    t = (0.0775 - origin[2]) / direction[2]
+                    if t > 0:
+                        est = origin + t * direction
+                        estimates.append(est)
+                        weights.append(1.0)
+
+        if estimates:
+            total_weight = sum(weights)
+            avg = sum(w * e for w, e in zip(weights, estimates)) / total_weight
+            return avg, env_det, eye_det
+        return None, env_det, eye_det
+
+    def format_observation(self, rgb_dict, ee_pos):
+        """Format visual detection results as text for the LLM."""
+        est, env_det, eye_det = self.estimate_apple_position(rgb_dict)
+        lines = []
+        lines.append("Visual perception (from camera images):")
+
+        if env_det:
+            cx, cy = env_det["center"]
+            lines.append(f"  env_camera sees red apple at pixel ({cx}, {cy}), size={env_det['pixels']} px")
+        else:
+            lines.append("  env_camera: red apple not visible")
+
+        if eye_det:
+            cx, cy = eye_det["center"]
+            lines.append(f"  eye_in_hand sees red apple at pixel ({cx}, {cy}), size={eye_det['pixels']} px")
+        else:
+            lines.append("  eye_in_hand: red apple not visible")
+
+        if est is not None:
+            rel = est - np.array(ee_pos)
+            dist = np.linalg.norm(rel)
+            lines.append(f"  Estimated apple position: [{est[0]:.3f}, {est[1]:.3f}, {est[2]:.3f}] m")
+            lines.append(f"  Relative to gripper:      [{rel[0]:.3f}, {rel[1]:.3f}, {rel[2]:.3f}] m")
+            lines.append(f"  Visual estimated distance: {dist:.3f} m")
+        else:
+            lines.append("  Unable to estimate apple position from cameras.")
+
+        return "\n".join(lines)
+
+
+
+
+
+
+class RobotEnv:
+    def __init__(self):
+        self.model = mujoco.MjModel.from_xml_path(SCENE_XML)
+        self.data = mujoco.MjData(self.model)
+        self.cam = CameraSystem(self.model, self.data)
+        self.vision = VisionProcessor(self.model, self.data)
+
+        # Joint qpos addresses
+        self.qpos_adr = []
+        for i in range(6):
+            jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"joint{i+1}")
+            self.qpos_adr.append(self.model.jnt_qposadr[jnt_id])
+        self.grip_adr = []
+        for name in ["left_gripper_joint", "right_gripper_joint"]:
+            jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            self.grip_adr.append(self.model.jnt_qposadr[jnt_id])
+
+        self.apple_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "apple")
+        self.gripper_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
+
+        self.joint_angles = np.array([0.0, 0.5, -1.2, 0.0, 0.8, 0.0])
+        self.gripper_opening = 0.035
+        self.phase = "search"
+        self.grasped = False
+        self.apple_attached = False
+        self._apply_joints()
+
+    def _apply_joints(self):
+        for i in range(6):
+            self.data.qpos[self.qpos_adr[i]] = self.joint_angles[i]
+        self.data.qpos[self.grip_adr[0]] = self.gripper_opening
+        self.data.qpos[self.grip_adr[1]] = self.gripper_opening
+        if self.apple_attached:
+            # Move apple with gripper
+            ee = self.data.xpos[self.gripper_body_id].copy()
+            self.model.body("apple").pos = ee + np.array([0, 0, -0.06])
+        mujoco.mj_forward(self.model, self.data)
+
+    def get_end_effector_pos(self):
+        return self.data.xpos[self.gripper_body_id].copy()
+
+    def get_apple_pos(self):
+        return self.data.xpos[self.apple_body_id].copy()
+
+    def set_joints(self, q, gripper):
+        self.joint_angles = np.copy(q)
+        self.gripper_opening = gripper
+        self._apply_joints()
+
+    def attach_apple(self):
+        if not self.apple_attached:
+            self.apple_attached = True
+            self._apply_joints()
+
+    def step(self):
+        # Apple follows gripper if attached; no physics stepping needed
+        if self.apple_attached:
+            self._apply_joints()
+
+    def close(self):
+        self.cam.close()
+
+
+# ============================================================================
+# Main
+# ============================================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-viewer", action="store_true")
+    parser.add_argument("--steps", type=int, default=300)
+    parser.add_argument("--save-frames", action="store_true")
+    args = parser.parse_args()
+
+    env = RobotEnv()
+
+
+    dt = 0.05
+    step_idx = 0
+
+    if args.no_viewer:
+        _run(env, args, dt, step_idx, use_viewer=False)
+    else:
+        _run(env, args, dt, step_idx, use_viewer=True)
+
+    
+    env.close()
+    print("11111111111111111111111111")
+    print("\nDone.")
+
+
+def _run(env, args, dt, step_idx, use_viewer):
+    loop_fn = _loop_with_viewer if use_viewer else _loop_headless
+    loop_fn(env, args, dt, step_idx)
+
+
+def _loop_headless(env, args, dt, step_idx):
+    while step_idx < args.steps and not env.grasped:
+        t0 = time.time()
+        env.step()
+        _sleep_remain(t0, dt)
+        step_idx += 1
+    print(f"\nFinished: {step_idx} steps, phase={env.phase}")
+
+
+def _loop_with_viewer(env, args, dt, step_idx):
+    with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
+        viewer.cam.azimuth = 135
+        viewer.cam.elevation = -20
+        viewer.cam.distance = 1.5
+        viewer.cam.lookat[:] = [0.2, 0, 0.3]
+
+        while viewer.is_running() and step_idx < args.steps and not env.grasped:
+            t0 = time.time()
+            frames = env.cam.capture_both(save=args.save_frames)
+            print('00000000000')
+            dq = np.array([0.0, 0.01, 0.01, 0.0, 0.01, 0.0])
+            env.joint_angles += dq
+            print(env.joint_angles)
+            env.set_joints(env.joint_angles, env.gripper_opening)
+            env.step()
+            viewer.sync()
+            _sleep_remain(t0, dt)
+            step_idx += 1
+
+    print(f"\nFinished: {step_idx} steps, phase={env.phase}")
+
+
+def _sleep_remain(t0, target_dt):
+    elapsed = time.time() - t0
+    sleep = target_dt - elapsed
+    if sleep > 0:
+        time.sleep(sleep)
+
+
+if __name__ == "__main__":
+    main()
