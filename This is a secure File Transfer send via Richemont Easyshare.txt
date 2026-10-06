@@ -2,9 +2,8 @@
 
 Private Message: 
 id,7434668
-apiKey: sk-ws-H.PLILEEY.tnrL.MEUCIQDh7j09aLwxd7ARj-4GsxroUP_d769acfLLHZPZJPS4WAIgA--XxYhe7d544ARAws9iOfvKVbc_ev4S7PZDDBMPucE
-apiHost: ws-9fj29p5g4c84eygc-vpc-uf6mkccrxko3e999sns4z.cn-beijing.maas.aliyuncs.com
-openAiCompatible: https://ws-9fj29p5g4c84eygc-vpc-uf6mkccrxko3e999sns4z.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+apiKey: 
+openAiCompatible: 
 
 模型列表
 qwen3.7-plus
