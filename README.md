@@ -1,2 +1,1 @@
-# robot_arm_6dof
-robot_arm_6dof
+6自由度机器人抓取苹果模拟。
